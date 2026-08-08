@@ -1,0 +1,74 @@
+name: rust CLI install certification
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "29 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-cli-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-head-cli:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - name: Check out certification harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: certification
+          persist-credentials: false
+          show-progress: false
+      - name: Check out the exact product head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: declarative-migrations/declarative-postgres-migrate.rs
+          ref: 5fd4057602481866662f9cbb8dea6677403bfa82
+          path: upstream
+          persist-credentials: false
+          show-progress: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: upstream -> target
+      - name: Validate generated test contract
+        working-directory: certification
+        run: node scripts/validate-plan.mjs
+      - name: Install Rust certification examples
+        shell: bash
+        run: |
+          rustfmt --edition 2021 --check certification/tests/formal_consumer.rs
+          rustfmt --edition 2021 --check certification/tests/cli_contract.rs
+          mkdir -p upstream/examples
+          cp certification/tests/formal_consumer.rs upstream/examples/formal_consumer.rs
+          cp certification/tests/cli_contract.rs upstream/examples/cli_contract.rs
+      - name: Strictly lint and run the public Rust API consumer
+        shell: bash
+        run: |
+          cargo clippy --manifest-path upstream/Cargo.toml --locked --examples -- -D warnings
+          cargo run --manifest-path upstream/Cargo.toml --locked --example formal_consumer
+      - name: Install the exact-head CLI with Cargo
+        shell: bash
+        run: >-
+          cargo install --path upstream --locked
+          --root "$RUNNER_TEMP/dpm-install" --force
+      - name: Run the installed CLI process contract in Rust
+        shell: bash
+        run: |
+          binary="$RUNNER_TEMP/dpm-install/bin/dpm"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            binary="${binary}.exe"
+          fi
+          cargo run --manifest-path upstream/Cargo.toml --locked --example cli_contract -- "$binary"
