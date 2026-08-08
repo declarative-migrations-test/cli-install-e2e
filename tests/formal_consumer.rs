@@ -8,8 +8,8 @@ fn main() {
         .acquire(OwnerId::new("cli-contract-consumer").expect("valid owner"))
         .expect("first owner acquires the lease");
 
-    let migration = Migration::new("SELECT 1")
-        .validate(|sql| ValidationProof::for_bytes(sql.as_bytes(), 1));
+    let migration =
+        Migration::new("SELECT 1").validate(|sql| ValidationProof::for_bytes(sql.as_bytes(), 1));
     let authorized = migration.authorize(&guard);
 
     assert_eq!(authorized.owner().as_str(), "cli-contract-consumer");
