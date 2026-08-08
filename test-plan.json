@@ -5,34 +5,44 @@
   "testOrganization": "declarative-migrations-test",
   "repository": "cli-install-e2e",
   "profile": "cli-contract",
-  "description": "cargo install; prebuilt binaries; flags-2-env; exit codes; offline help",
+  "description": "Cross-platform Cargo installation plus Rust public-API and process-contract certification",
   "focus": [
-    "cargo install",
-    "prebuilt binaries",
-    "flags-2-env",
-    "exit codes",
-    "offline help"
+    "cargo install from exact product head",
+    "external Rust typestate consumer",
+    "offline help and version",
+    "stable unknown-command exit code",
+    "Linux macOS and Windows packaging"
   ],
   "services": [],
-  "matrix": {},
+  "matrix": {
+    "os": [
+      "ubuntu-24.04",
+      "macos-14",
+      "windows-2022"
+    ]
+  },
   "requiredChecks": [
-    "help",
+    "generated-contract",
+    "rustfmt",
+    "public-rust-api",
+    "cargo-install",
+    "offline-help",
     "version",
-    "flags-2-env",
     "exit-codes",
-    "shell-completions",
-    "install-packaging"
+    "os-matrix"
   ],
   "sources": [
     {
       "fullName": "declarative-migrations/declarative-postgres-migrate.rs",
       "exists": true,
-      "branch": "main",
-      "sha": "21eb846e356b2a5aff068b21e77903e6cca50452",
+      "branch": "agent/formal-borrow-checked-migrations",
+      "sha": "5fd4057602481866662f9cbb8dea6677403bfa82",
       "visibility": "public"
     }
   ],
-  "sourceGates": [],
+  "sourceGates": [
+    "product PR #30 exact head"
+  ],
   "imports": [],
   "security": {
     "immutableSourcePins": true,
