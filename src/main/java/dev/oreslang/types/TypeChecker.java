@@ -207,6 +207,13 @@ public final class TypeChecker {
         Set<String> parentNames = new HashSet<>();
         for (Ast.TypeRef parent : klass.parents()) {
             if (!parentNames.add(parent.name())) throw new IllegalArgumentException("duplicate parent class '" + parent.name() + "' on " + klass.name());
+            if (parent.name().equals("Object") || parent.name().equals("List")) {
+                if (parent.inferArguments() || !parent.arguments().isEmpty()) {
+                    throw new IllegalArgumentException("built-in inheritance marker '" + parent.name() + "' does not take type arguments");
+                }
+                resolveClassParent(parent, klass);
+                continue;
+            }
             resolve(parent, classGenerics, self);
             resolveClassParent(parent, klass);
         }
