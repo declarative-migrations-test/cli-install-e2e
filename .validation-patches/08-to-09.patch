@@ -1,0 +1,1409 @@
+diff --git a/.github/workflows/native-cli-contract.yml b/.github/workflows/native-cli-contract.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/native-cli-contract.yml
+@@ -0,0 +1,27 @@
++name: Native Oreslang CLI source contract
++
++on:
++  push:
++    branches: [main, 'feat/**']
++  pull_request:
++
++permissions:
++  contents: read
++
++jobs:
++  native-cli-typecheck-and-io:
++    runs-on: ubuntu-latest
++    timeout-minutes: 20
++    steps:
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
++        with:
++          persist-credentials: false
++      - uses: graalvm/setup-graalvm@v1
++        with:
++          version: '25.3'
++          java-version: '25'
++          distribution: 'graalvm'
++          github-token: ${{ secrets.GITHUB_TOKEN }}
++          cache: maven
++      - name: Native CLI compiler and filesystem security contracts
++        run: mvn -B -ntp -Dtest=NativeCliIoTest test
+diff --git a/.github/workflows/stdlib-boundary.yml b/.github/workflows/stdlib-boundary.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/stdlib-boundary.yml
+@@ -0,0 +1,27 @@
++name: Native Oreslang stdlib boundary
++on:
++  pull_request:
++    paths:
++      - 'stdlib/**'
++      - 'tools/stdlib-boundary-audit/**'
++      - '.github/workflows/stdlib-boundary.yml'
++  push:
++    branches: [main]
++    paths:
++      - 'stdlib/**'
++      - 'tools/stdlib-boundary-audit/**'
++      - '.github/workflows/stdlib-boundary.yml'
++jobs:
++  audit:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          components: clippy
++      - name: Rust tests
++        run: cargo test --manifest-path tools/stdlib-boundary-audit/Cargo.toml --all-targets
++      - name: Clippy
++        run: cargo clippy --manifest-path tools/stdlib-boundary-audit/Cargo.toml --all-targets -- -D warnings
++      - name: Native stdlib boundary check
++        run: cargo run --manifest-path tools/stdlib-boundary-audit/Cargo.toml -- stdlib
+diff --git a/contracts/v1/semantics/README.md b/contracts/v1/semantics/README.md
+--- a/contracts/v1/semantics/README.md
++++ b/contracts/v1/semantics/README.md
+@@ -59,3 +59,24 @@ Follow-up work: integer width/overflow specification, stable diagnostic IDs
+ rather than regular-expression mappings, canonical Oreslang JSON stdout,
+ actor message event traces, cycle-safe reference/ownership cases, replay-fenced
+ cancellation and fair preemption under strict resource budgets.
++
++## Externally admitted actor messages
++
++The actor trace protocol now defines an `admit` event: a trusted producer
++successfully enqueues a message into a live actor's native mailbox. It carries
++`actor` (the receiver) and `message_id`, without inventing an actor identity
++for the external host thread. Subsequent `receive` must have the same ID
++and can occur at most once. All existing `send` semantics remain unchanged.
++
++LLVM's `oreslang-actor-trace-test` and `traces/native_probe.py` drive a
++real `HungryCarrier` with 24 accepted messages, wait for corresponding
++single-threaded handler callbacks, verify `CarrierStats` and lifecycle,
++then validate the complete causally reconstructed trace via JSON Schema and
++the backend-neutral state machine. The funded workflow repeats this 12 times.
++
++**Limits:** This tests the native continuation carrier, not actors compiled
++from `.ores`, not realtime isolation, and not cancellation traces or a
++production tracing API. The sequence is reconstructed after join from real
++admission and callback evidence, not a timestamped total order. Java/Graal
++shares the schema and adversarial validator but does not yet emit native
++carrier traces.
+diff --git a/contracts/v1/semantics/traces/main.tsp b/contracts/v1/semantics/traces/main.tsp
+--- a/contracts/v1/semantics/traces/main.tsp
++++ b/contracts/v1/semantics/traces/main.tsp
+@@ -6,7 +6,7 @@ using TypeSpec.JsonSchema;
+ namespace Oreslang.Conformance.ActorTraceV1 {
+   model Event {
+     seq: int32;
+-    kind: "spawn" | "send" | "receive" | "exclusive_acquire" |
++    kind: "spawn" | "admit" | "send" | "receive" | "exclusive_acquire" |
+           "exclusive_release" | "terminate";
+     actor: string;
+     target?: string;
+diff --git a/contracts/v1/semantics/traces/test_trace.py b/contracts/v1/semantics/traces/test_trace.py
+--- a/contracts/v1/semantics/traces/test_trace.py
++++ b/contracts/v1/semantics/traces/test_trace.py
+@@ -32,6 +32,27 @@ def test_good_trace(self):
+         self.assertEqual(metrics["messages_received"], 1)
+         self.assertEqual(metrics["actors"], 2)
+ 
++    def test_external_ingress_roundtrip(self):
++        trace = {"schema_version":"1.0.0","complete":True,
++                 "events":[
++                     {"seq":0,"kind":"spawn","actor":"receiver"},
++                     {"seq":1,"kind":"admit","actor":"receiver","message_id":"external_1"},
++                     {"seq":2,"kind":"receive","actor":"receiver","message_id":"external_1"},
++                     {"seq":3,"kind":"terminate","actor":"receiver"},
++                 ]}
++        self.assertEqual(check_trace(trace)["messages_received"], 1)
++        duplicate = copy.deepcopy(trace)
++        duplicate["events"].insert(2, dict(seq=2,kind="admit",actor="receiver",
++                                           message_id="external_1"))
++        for seq,event in enumerate(duplicate["events"]): event["seq"] = seq
++        self.assert_invalid(duplicate)
++        missing = copy.deepcopy(trace)
++        del missing["events"][1]["message_id"]
++        self.assert_invalid(missing)
++        wrong = copy.deepcopy(trace)
++        wrong["events"][1]["actor"] = "unspawned"
++        self.assert_invalid(wrong)
++
+     def test_partial_trace_does_not_imply_eventual_delivery(self):
+         t = good()
+         t["complete"] = False
+diff --git a/contracts/v1/semantics/traces/trace.schema.json b/contracts/v1/semantics/traces/trace.schema.json
+--- a/contracts/v1/semantics/traces/trace.schema.json
++++ b/contracts/v1/semantics/traces/trace.schema.json
+@@ -39,6 +39,7 @@
+         "kind": {
+           "enum": [
+             "spawn",
++            "admit",
+             "send",
+             "receive",
+             "exclusive_acquire",
+@@ -118,6 +119,23 @@
+               "resource"
+             ]
+           }
++        },
++        {
++          "if": {
++            "properties": {
++              "kind": {
++                "const": "admit"
++              }
++            },
++            "required": [
++              "kind"
++            ]
++          },
++          "then": {
++            "required": [
++              "message_id"
++            ]
++          }
+         }
+       ]
+     }
+diff --git a/contracts/v1/semantics/traces/validate.py b/contracts/v1/semantics/traces/validate.py
+--- a/contracts/v1/semantics/traces/validate.py
++++ b/contracts/v1/semantics/traces/validate.py
+@@ -37,6 +37,8 @@ def check_trace(trace):
+         permitted = {"seq", "kind", "actor"}
+         if kind == "send":
+             permitted.update(("target", "message_id"))
++        elif kind == "admit":
++            permitted.add("message_id")
+         elif kind == "receive":
+             permitted.add("message_id")
+         elif kind in ("exclusive_acquire", "exclusive_release"):
+@@ -50,7 +52,12 @@ def check_trace(trace):
+             continue
+         if actor not in actors:
+             raise TraceViolation(f"unknown or terminated actor: {actor}")
+-        if kind == "send":
++        if kind == "admit":
++            msg = e["message_id"]
++            if msg in messages:
++                raise TraceViolation(f"duplicate ingress id: {msg}")
++            messages[msg] = actor
++        elif kind == "send":
+             target, msg = e["target"], e["message_id"]
+             if target not in actors:
+                 raise TraceViolation(f"target not live: {target}")
+diff --git a/docs/ASYNC_IO.md b/docs/ASYNC_IO.md
+--- a/docs/ASYNC_IO.md
++++ b/docs/ASYNC_IO.md
+@@ -79,3 +79,47 @@ carrier**, proving that the first actor's pending read does not occupy that carr
+ EOF, errors and future results travel through normal continuation lowering.
+ 
+ Run `mvn -Dtest=AsyncNativeIoTest test` with JDK 25.
++
++## Synchronous directory operations (Oreslang stack CLI)
++
++The Java/Graal interpreter exposes capability-gated `fs.list_dir(path): List<String>`,
++`fs.is_dir(path): bool` and `fs.is_symlink(path): bool`. `list_dir` returns only
++the immediate child **names**, sorted lexically, and refuses directories with
++more than 20,000 children. It rejects a symlink at the input path; callers
++must check children before descending. Each operation requires scoped filesystem
++read permission. These metadata operations are not a race-free openat-style
++directory handle and are not sufficient for processing hostile mutable trees.
++The language also exposes `String.split_literal`, `trim`, `starts_with`,
++`ends_with`, and `contains_literal` for source-level code generators.
++
++## Audited Oreslang Stack CLI source-generation primitives
++
++`fs.write_text_atomic(path, value)` uses a temporary UTF-8 file adjacent to
++the destination and an atomic move/replace. It requires write permission on
++both the lexical path and canonical parent target, refuses an existing symlink
++destination, and does not fall back to a non-atomic move. Atomic replacement
++is **one file at a time**, not a transaction over all RPC/Lambda outputs.
++
++Metadata operations `fs.is_dir` and `fs.is_symlink` resolve and authorize
++the parent before inspecting a child entry without following its terminal
++symbolic link. They can inspect an exactly granted project root even when
++its parent directory is not granted; symlinked ancestors cannot extend the
++granted read scope. `fs.list_dir` returns immediate names in sorted order,
++rejects symlink inputs, and caps enumeration at 20,000 names.
++
++All path-based checks remain subject to time-of-check/time-of-use races when
++a different process can concurrently change directory entries. This API is
++not a directory-handle sandbox for actively hostile mutable trees. Use it
++for locally trusted project source generation; a production hostile-tenant
++builder must add race-free directory capabilities and multi-file transaction
++admission.
++
++**Validation:** The private mirror of the Java/Graal reference runtime
++executed the `NativeCliIoTest` suite (5 passing tests) including the complete
++`oreslang-stack-cli/src/main.ores` source, symlink escape denial and atomic
++write operations:
++https://github.com/ores-stack/ores-stack-cli/actions/runs/37884619591
++
++The downstream generator additionally passed its full real-runtime command
++integration:
++https://github.com/ores-stack/ores-stack-cli/actions/runs/37884619670
+diff --git a/docs/CORE_NATIVE_STDLIB_AUDIT_2026-10-09.md b/docs/CORE_NATIVE_STDLIB_AUDIT_2026-10-09.md
+new file mode 100644
+--- /dev/null
++++ b/docs/CORE_NATIVE_STDLIB_AUDIT_2026-10-09.md
+@@ -0,0 +1,101 @@
++# Core native-Oreslang migration audit (2026-10-09)
++
++Status: **inventory and migration plan, not an implementation/merge approval**  
++Source: `main` at `508e2d9f7dcbc3490a7a5219508114c67092e957`  
++Scope: `oreslang-source.java` only; draft PR branches are examined separately, not assumed to exist on `main`.
++
++## Executive findings
++
++1. **No safe Java deletion identified solely by same-branch native-Oreslang duplication.** On the audited `main`, `stdlib/` contains **only `testing.ores`**. `NativeTestingFrameworkTest.java` is a JUnit integration test that *executes* this Oreslang library, not a second testing-framework implementation. Retain it.
++2. User-facing standard-library policy still lives inside the 8,871-line `OresEvalRootNode.java` alongside the evaluator. In particular, string helpers (`member`, ~5911-5957), stdio facades (~5969-5990 and ~8816+), Future combinator dispatch (~6363-6404), list accessors/mutation (~6491-6527), and Option/Result combinators (~6630-6683) are Java-coded. **These are extraction candidates, not automatically deletable code.**
++3. Compiler/Truffle bindings, AST/IR, scheduler admission, isolated actor transport, host capability enforcement, OS I/O, mutex/channel synchronization and collection-storage intrinsics cannot simply be replaced by guest library routines.
++4. Native-first stdlib loading is not yet available on this `main`: an existing draft PR proposes it (#218) and an overlapping draft (#237) adds `StandardLibraryResolver`. Consolidate them before attempting to replace built-in names.
++5. Main CI failures on the audited SHA do **not** establish implementation failures. The observed `ci`, `fast-ci`, Graal conformance and native CLI run jobs reported `failure` with **zero executed steps**; root cause/runner admission needs separate diagnosis and exact-head execution.
++
++## Boundary classification
++
++| Current code (main) | Classification | Intended disposition | Required proof before deletion |
++| --- | --- | --- | --- |
++| `stdlib/testing.ores` | Already native Oreslang | Keep | Its Java JUnit tests should continue to test the actual .ores module. |
++| `NativeTestingFrameworkTest.java` | Host test, **not** duplicate library | Keep | Do not delete merely because tests are named `Native*`. |
++| `OresEvalRootNode.member(String)` helpers: identifier/route-name checks, trim, split, prefix/suffix/contains | Library policy over string primitives | Extract policy into `std/string` or `std/text`; retain only irreducible immutable string operations in backend intrinsics | Exhaustive ASCII/Unicode/empty/boundary conformance, exact original semantics or versioned change. |
++| `OresEvalRootNode.optionMember/resultMember` | Guest-visible convenience semantics | Move to native Oreslang methods/functions over sealed Option/Result payload/tag intrinsics | Panic-vs-Result semantics, generic return types, single evaluation, return/ownership propagation, no host identity leaks. |
++| `OresEvalRootNode` `List.get/add/set/size`, Java List/Map storage | Mixed semantic API and backing storage | Move algorithms, equality, order and collection families to `std/collections`; keep opaque storage/load/store/integer-index safety as intrinsics | Bounds, aliasing, freezing, mutation borrow, iteration invalidation, identity/cycles, actor sendability, cross-backend equivalence. |
++| `OresFutures`, `Future.map/compose/onSuccess` | Mixed combinators and runtime waiter ownership | Put pure composition API in Oreslang, retain scheduler-owned completion, cancellation, waiter detach and wakeup in runtime | Cancellation races, deterministic result order, no callbacks on producer I/O threads, fairness/quota accounting. |
++| `stdio.stdout.log/logList`/display formatting | Formatting is library policy; stdout write is capability | Move formatting/join logic to `std/log`; keep checked output sink and bounded marshaling as intrinsics | STDOUT policy, escaping, bounded log output, cyclic objects, lazy evaluation side effects. |
++| `NativeIo.java`/`AsyncNativeIo.java` | Privileged OS boundary | Keep permission checks, canonicalization, worker/admission and opaque handles in backend; move safe path/text/HTTP *library policy* to Oreslang | Same-path authorization at submission and execution, symlink/TOCTOU threat model, deadlines and close under saturation. |
++| `NativeHttp.java` | Transport and security boundary | Keep socket/framing, admission, revocation, ownership and request-lifetime enforcement backend-side; extract routing, protocol convenience, response-building policy where safe | Smuggling/framing, percent decode, request limits, response ownership, actor cancellation. |
++| `ActorRuntime`, `ChannelRuntime`, `OresMutex`, `OresScheduler`, `OresFuture` | Runtime concurrency primitives | Keep as backend implementation until native ABI equivalents can replace them; expose guest abstractions in .ores | Formal linearization points, cancellation, fairness, bounded queues, memory ordering, isolation, no actor-carrier blocking. |
++| `Lexer/Parser/TypeChecker/OwnershipChecker`, `OresLanguage` | Compiler / Truffle backend | Keep; factor reusable typed IR and backend-independent runtime contracts | Differential conformance against canonical semantic tests and non-JVM backend. |
++| `RuntimeGarbageCollector` | Host-resource cleanup support | Keep narrowly documented; do **not** claim it is an independent guest heap collector | Explicit resource lifetime / cycle and finalizer tests. |
++
++The current `docs/NATIVE_RUNTIME_ABI.md` already explicitly favors `Oreslang -> typed IR -> intrinsics -> native runtime -> OS`. Maintain capability isolation, checked casts and Ores-owned type tags. Do not use arbitrary Java host reflection as an implementation shortcut.
++
++## Missing pieces / follow-up backlog
++
++The following are **not complete on audited main**, even if drafts or designs exist:
++
++| Priority | Gap | Definition of done | Existing work |
++| --- | --- | --- | --- |
++| P0 | Canonical packaged `std/*` module resolver | Resolve, compile, typecheck and link versioned .ores library modules in JIT/AOT/hot-load; disallow `java:` and unsafe host interop; prevent path traversal/shadowing. | #218 and #237 overlap; restack/consolidate. |
++| P0 | Typed runtime intrinsic/ABI registry | One versioned manifest for names, signatures, purity/effects, capabilities, ownership, actor sendability and backend feature flags; compiler and runtime derive surfaces from same contract. | `docs/NATIVE_RUNTIME_ABI.md` is direction, not stable ABI. |
++| P0 | Native collection storage with .ores algorithms | `Array/List/Map/Set` ownership/equality/order semantics identical in Truffle and native backend, no exposing java.util. | #135, #237. |
++| P0 | Runtime isolation and host resource checks | Proof/negative tests that stdlib cannot escalate capabilities or leak host handles across private/untrusted actor boundaries. | Some tests on main; broader backend contract missing. |
++| P1 | Option/Result native combinators | `map/flat_map/map_err/or_else/unwrap*`, typed generic propagation, panics vs recoverable errors. | #210. |
++| P1 | Native Future/Iterator/Stream API | Guest-facing APIs with scheduler-owned callbacks, backpressure, lifecycle and cancellation. Observable bridges use the same engine. | #210, #293. |
++| P1 | Text/encoding/format APIs | Explicit Unicode/codepoint/grapheme semantics, UTF-8 encode/decode and allocation-aware builders; keep literal string ops separate from HTML/URL sanitization. | `docs/string-transform.md` only documents current primitive. |
++| P1 | Safe file/network/HTTP library | Opaque OS handles, native async transfer, common error types; keep authorization, limits and framing out of guest policy. | #131, #221 and native transport stack. |
++| P1 | Structured error/Result taxonomy | Portable filesystem/network/timeout/cancel/parse errors, with stable codes and sanitized diagnostics. | Current host exceptions leak backend-shaped classification. |
++| P1 | Runtime/stdlib parity CI | Boot stdlib from packaged source, deny Java interop, execute identical suites under JIT, AOT/Native Image, strict actor and native variants. | Existing CI workflows; execution not confirmed on audited SHA. |
++| P2 | Native stdlib `math/time/serde/json/regex/collections` packages | Native Oreslang policy atop narrowly typed numeric/clock/codec intrinsics; TypeSpec/JSON Schema contracts where appropriate. | Track as incremental libraries; avoid broad Java wrappers. |
++| P2 | Native testing expansion | Parallel isolation, per-test monotonic timeouts, snapshots, coverage, fuzz shrinking, stable JSON reporting and Rust CLI test discovery. | Explicitly deferred in `docs/TESTING.md`. |
++| P2 | Full managed guest heap / arena semantics | Concretely define cycles/weak refs/arenas/destructor behavior rather than describing `RuntimeGarbageCollector` as a tracing collector. | Draft runtime PRs and `docs/RUNTIME_BOUNDARY_AUDIT.md`. |
++| P2 | Effects and `pure` enforcement | Compiler transitive closure over imports/callbacks/FFI with fail-closed effects and backend-independent verification. | `docs/PURE.md` marks itself **draft**. |
++
++## Existing PRs: do not independently rewrite their functionality
++
++- #218 (`207246c`): packaged native core loader; **draft, dirty**.
++- #237 (`9bd4c2c`): native collections; **draft, unstable**, overlaps resolver/stdlib with #218.
++- #210 (`48e67e0`): Option/Result/Future/Iterator/Stream; **draft, unstable**.
++- #135 (`05faf42`): native C core + storage/net primitives; **draft**.
++- #131 (`0b4e606`): native HTTP stdlib; **draft, dirty**, notes protocol migration incomplete.
++- #221 (`1006b92`): native filesystem; **draft, dirty**, built on other native-network work.
++- #293 (`4e17130`): rx-ores bridge; **draft, unstable**, still Java host implementation, not yet native Oreslang guest facade.
++- #509: Rust formal-analysis work; keep Rust (not Python) for any new core-audit tool.
++
++Branch mergeability is advisory and changes with the target branch. Re-evaluate on the **exact new head**, not an old green ancestor.
++
++## Deletion gate: what qualifies as “remove Java implemented in native Oreslang”
++
++A Java user-visible implementation can be removed **only after**:
++
++1. The equivalent `.ores` definition is actually checked into the merged main tree and is executable via versioned stdlib import/load.
++2. The Java implementation is reduced to an intrinsic, compiler backend, privileged transport primitive, or deleted if genuinely unused.
++3. Compiler and runtime API contracts agree on signatures, generic constraints, error behavior, capability scope and ownership.
++4. Tests execute both old and new paths against the same vectors (including faults, races, cancellation, quota exhaustion and malformed inputs).
++5. AOT/Native Image resource packaging and fresh hot-load contexts can resolve and execute the library without privileged Java host access.
++6. CI jobs actually run on the exact PR head SHA; zero-step/runner-admission failure is **not** a compile/test failure.
++7. No duplicate exposed semantic owner remains; otherwise explicitly tag the old branch as compatibility shim with sunset gates.
++
++The `NativeTestingFrameworkTest.java` JUnit file **must not** be removed by this rule; it is a host conformance test, not the stdlib logic.
++
++## Suggested implementation order
++
++1. Restack/merge the resolver foundation from #218/#237, resolving their overlap; make the source and absence of `java:` imports mechanically auditable.
++2. Stabilize #135's opaque storage/intrinsics, then land #237 collection algorithms, and only then retire Java collection **policy** (not backend storage operations).
++3. Add the Option/Result semantic layer from #210 and retire evaluator convenience method tables incrementally.
++4. Stabilize Futures/Stream/Rx on the same scheduler/cancellation engine; keep lock-free atomic state and transport handling backend-owned.
++5. Stage files/network/HTTP only with complete security/fuzz/actor lifecycle tests; no eager transport rewrite.
++6. Introduce one CI conformance command using the exact-head built artifact, plus Rust tooling for any new static audit or formal-model checks.
++
++## Current validation evidence / limitations
++
++At audit time, `main` SHA `508e2d9...` had failed workflow runs:
++- [ci](https://github.com/ores-truffle-oreslang/oreslang-source.java/actions/runs/37890879237)
++- [fast-ci](https://github.com/ores-truffle-oreslang/oreslang-source.java/actions/runs/37890879113)
++- [Graal conformance](https://github.com/ores-truffle-oreslang/oreslang-source.java/actions/runs/37890879096)
++- [Native CLI contract](https://github.com/ores-truffle-oreslang/oreslang-source.java/actions/runs/37890879128)
++
++The inspected job summaries have zero steps; no successful source execution is established by those failures. Investigate runner admission and validate in a funded test organization **only** if the mirror branch verifies exact Git tree/blob identities and runs with its own token. Do not treat a test of a different source tree as verification for this SHA.
++
++This audit is based on a complete repository path inventory, sampled relevant Java/native code and docs, and available PR metadata/diffs. It is not a full call graph or a verified runtime test execution. No runtime code was removed in this audit because no same-branch Java-vs-`.ores` implementation duplicate was proven.
+diff --git a/src/main/java/dev/oreslang/nodes/OresEvalRootNode.java b/src/main/java/dev/oreslang/nodes/OresEvalRootNode.java
+--- a/src/main/java/dev/oreslang/nodes/OresEvalRootNode.java
++++ b/src/main/java/dev/oreslang/nodes/OresEvalRootNode.java
+@@ -5910,6 +5910,36 @@ private Object eval(Ast.Expr expr, Env env) {
+ 
+         private Object member(Object receiver, String name, Env env) {
+             if (receiver instanceof String text) {
++                if (name.equals("split_literal")) {
++                    return (Invokable) args -> {
++                        requireOne(args, "string.split_literal");
++                        String delimiter = requireString(args.getFirst(), "string.split_literal delimiter");
++                        if (delimiter.isEmpty()) throw new IllegalArgumentException("split_literal delimiter cannot be empty");
++                        return new java.util.ArrayList<>(java.util.Arrays.asList(text.split(java.util.regex.Pattern.quote(delimiter), -1)));
++                    };
++                }
++                if (name.equals("trim")) {
++                    return (Invokable) args -> { requireZero(args, "string.trim"); return text.trim(); };
++                }
++                if (name.equals("is_identifier") || name.equals("is_route_segment")) {
++                    return (Invokable) args -> {
++                        requireZero(args, "string." + name);
++                        return name.equals("is_identifier")
++                            ? text.matches("[A-Za-z_][A-Za-z0-9_]*")
++                            : text.matches("(?:[A-Za-z0-9_-]+|\\[[A-Za-z_][A-Za-z0-9_]*\\])");
++                    };
++                }
++                if (name.equals("starts_with") || name.equals("ends_with") || name.equals("contains_literal")) {
++                    return (Invokable) args -> {
++                        requireOne(args, "string." + name);
++                        String needle = requireString(args.getFirst(), "string." + name + " needle");
++                        return switch (name) {
++                            case "starts_with" -> text.startsWith(needle);
++                            case "ends_with" -> text.endsWith(needle);
++                            default -> text.contains(needle);
++                        };
++                    };
++                }
+                 if (!name.equals("replace_literal")) {
+                     throw new IllegalArgumentException("unknown string member " + name);
+                 }
+@@ -5969,6 +5999,7 @@ private Object member(Object receiver, String name, Env env) {
+                                 "fs.read_text_async", () -> fs.readText(values));
+                     };
+                     case "write_text" -> (Invokable) fs::writeText;
++                    case "write_text_atomic" -> (Invokable) fs::writeTextAtomic;
+                     case "write_text_async" -> (Invokable) args -> {
+                         List<Object> values = immutableIoStrings(args);
+                         return context.nativeIo().submit(context, dev.oreslang.runtime.RuntimePermissions.Permission.WRITE,
+@@ -5980,6 +6011,9 @@ private Object member(Object receiver, String name, Env env) {
+                         return context.nativeIo().submit(context, dev.oreslang.runtime.RuntimePermissions.Permission.WRITE,
+                                 "fs.append_text_async", () -> fs.appendText(values));
+                     };
++                    case "list_dir" -> (Invokable) fs::listDir;
++                    case "is_dir" -> (Invokable) fs::isDir;
++                    case "is_symlink" -> (Invokable) fs::isSymlink;
+                     case "exists" -> (Invokable) fs::exists;
+                     case "exists_async" -> (Invokable) args -> {
+                         List<Object> values = immutableIoStrings(args);
+@@ -8705,6 +8739,14 @@ private Object writeText(List<Object> args) {
+                     requireString(args.get(1), "fs.write_text value"));
+             return null;
+         }
++        private Object writeTextAtomic(List<Object> args) {
++            requireTwo(args, "fs.write_text_atomic");
++            NativeIo.writeTextAtomic(
++                    context,
++                    requireString(args.get(0), "fs.write_text_atomic path"),
++                    requireString(args.get(1), "fs.write_text_atomic value"));
++            return null;
++        }
+         private Object appendText(List<Object> args) {
+             requireTwo(args, "fs.append_text");
+             NativeIo.appendText(
+@@ -8716,6 +8758,15 @@ private Object appendText(List<Object> args) {
+         private Object exists(List<Object> args) {
+             return NativeIo.exists(context, requireStringArg(args, "fs.exists"));
+         }
++        private Object listDir(List<Object> args) {
++            return NativeIo.listDir(context, requireStringArg(args, "fs.list_dir"));
++        }
++        private Object isDir(List<Object> args) {
++            return NativeIo.isDir(context, requireStringArg(args, "fs.is_dir"));
++        }
++        private Object isSymlink(List<Object> args) {
++            return NativeIo.isSymlink(context, requireStringArg(args, "fs.is_symlink"));
++        }
+         private Object remove(List<Object> args) {
+             NativeIo.remove(context, requireStringArg(args, "fs.remove"));
+             return null;
+diff --git a/src/main/java/dev/oreslang/runtime/CapabilityChecker.java b/src/main/java/dev/oreslang/runtime/CapabilityChecker.java
+--- a/src/main/java/dev/oreslang/runtime/CapabilityChecker.java
++++ b/src/main/java/dev/oreslang/runtime/CapabilityChecker.java
+@@ -446,6 +446,9 @@ else if (expr instanceof Ast.CallExpr c) {
+                 }
+                 if (path.startsWith("fs.read")
+                         || path.startsWith("fs.exists")
++                        || path.startsWith("fs.list_dir")
++                        || path.startsWith("fs.is_dir")
++                        || path.startsWith("fs.is_symlink")
+                         || path.startsWith("fs.stat")
+                         || path.startsWith("File.read")
+                         || path.startsWith("File.exists")
+diff --git a/src/main/java/dev/oreslang/runtime/NativeIo.java b/src/main/java/dev/oreslang/runtime/NativeIo.java
+--- a/src/main/java/dev/oreslang/runtime/NativeIo.java
++++ b/src/main/java/dev/oreslang/runtime/NativeIo.java
+@@ -45,6 +45,110 @@ public static boolean exists(OresContext context, String rawPath) {
+         return Files.exists(path);
+     }
+ 
++    /**
++     * Bounded, sorted immediate child names. This is deliberately NOT a path
++     * walker: the guest checks each next component with is_symlink and is_dir.
++     */
++    public static List<String> listDir(OresContext context, String rawPath) {
++        Path lexical = Path.of(rawPath).toAbsolutePath().normalize();
++        context.requirePermission(RuntimePermissions.Permission.READ, lexical.toString(), "fs.list_dir");
++        if (Files.isSymbolicLink(lexical)) throw new SecurityException("fs.list_dir refuses symlink: " + lexical);
++        Path path = canonicalExistingPath(rawPath);
++        context.requirePermission(RuntimePermissions.Permission.READ, path.toString(), "fs.list_dir");
++        if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
++            throw new IllegalArgumentException("fs.list_dir requires directory: " + path);
++        }
++        try (java.util.stream.Stream<Path> stream = Files.list(path)) {
++            List<String> names = stream.limit(20001).map(p -> p.getFileName().toString()).sorted().toList();
++            if (names.size() > 20000) throw new IllegalArgumentException("fs.list_dir exceeds 20000 entries: " + path);
++            return new java.util.ArrayList<>(names);
++        } catch (IOException failure) {
++            throw ioFailure("list directory", path, failure);
++        }
++    }
++
++    /**
++     * Resolve the parent directory before probing an entry. Permission checks
++     * cover both the lexical path and its actual parent; a symlinked ancestor
++     * cannot be used to inspect names outside the granted source root.
++     * Metadata cannot provide race-free traversal on an attacker-writable tree.
++     */
++    private static Path metadataTarget(OresContext context, String rawPath, String operation) {
++        Path lexical = lexicalPath(rawPath);
++        Path parent = lexical.getParent();
++        if (parent == null) throw new IllegalArgumentException("metadata path has no parent");
++        // Metadata only reads the entry in its parent, not the target of a
++        // symbolic link. Requiring READ on the child would canonicalize a
++        // symlink to its target and incorrectly reject detecting unsafe links.
++        // Resolve/check the parent instead; ancestor escapes still fail.
++        Path canonicalParent = realPath(parent);
++        Path target = canonicalParent.resolve(lexical.getFileName());
++        try {
++            context.requirePermission(RuntimePermissions.Permission.READ,
++                    canonicalParent.toString(), operation);
++        } catch (SecurityException parentDenied) {
++            // A caller may have an exact READ grant for the root directory,
++            // without a grant on /tmp or the parent of that root. Allow
++            // metadata on that exact ordinary entry but never dereference an
++            // ungranted terminal symlink.
++            if (Files.isSymbolicLink(target)) throw parentDenied;
++            context.requirePermission(RuntimePermissions.Permission.READ,
++                    target.toString(), operation);
++        }
++        return target;
++    }
++
++    public static boolean isSymlink(OresContext context, String rawPath) {
++        return Files.isSymbolicLink(metadataTarget(context, rawPath, "fs.is_symlink"));
++    }
++
++    public static boolean isDir(OresContext context, String rawPath) {
++        return Files.isDirectory(metadataTarget(context, rawPath, "fs.is_dir"),
++                LinkOption.NOFOLLOW_LINKS);
++    }
++
++    /**
++     * Generate a complete UTF-8 file beside the destination and replace it
++     * atomically. Never open the destination for truncation, nor follow a
++     * symlink in the destination slot. The parent is canonicalized and checked
++     * against the caller's WRITE grant before any mutation.
++     */
++    public static void writeTextAtomic(OresContext context, String rawPath, String value) {
++        Path lexical = lexicalPath(rawPath);
++        if (Files.isSymbolicLink(lexical)) {
++            throw new SecurityException("fs.write_text_atomic refuses symlink: " + lexical);
++        }
++        Path parent = lexical.getParent();
++        if (parent == null) throw new IllegalArgumentException("atomic write path has no parent");
++        Path canonicalParent = realPath(parent);
++        Path target = canonicalParent.resolve(lexical.getFileName());
++        context.requirePermission(RuntimePermissions.Permission.WRITE, lexical.toString(), "fs.write_text_atomic");
++        context.requirePermission(RuntimePermissions.Permission.WRITE, target.toString(), "fs.write_text_atomic");
++        if (!Files.isDirectory(canonicalParent, LinkOption.NOFOLLOW_LINKS)) {
++            throw new IllegalArgumentException("atomic write parent is not a directory: " + parent);
++        }
++        if (Files.isSymbolicLink(target)) {
++            throw new SecurityException("fs.write_text_atomic refuses destination symlink: " + target);
++        }
++        Path temp = null;
++        try {
++            temp = Files.createTempFile(canonicalParent, ".oreslang-stack-", ".tmp");
++            Files.writeString(temp, value, StandardCharsets.UTF_8);
++            if (Files.isSymbolicLink(target)) {
++                throw new SecurityException("fs.write_text_atomic refuses destination symlink: " + target);
++            }
++            Files.move(temp, target,
++                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
++                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++        } catch (IOException failure) {
++            throw ioFailure("atomic write", target, failure);
++        } finally {
++            if (temp != null) {
++                try { Files.deleteIfExists(temp); } catch (IOException ignored) { }
++            }
++        }
++    }
++
+     public static void writeText(OresContext context, String rawPath, String value) {
+         Path path = canonicalWritePath(rawPath);
+         context.requirePermission(RuntimePermissions.Permission.WRITE, path.toString(), "fs.write_text");
+diff --git a/src/main/java/dev/oreslang/types/TypeChecker.java b/src/main/java/dev/oreslang/types/TypeChecker.java
+--- a/src/main/java/dev/oreslang/types/TypeChecker.java
++++ b/src/main/java/dev/oreslang/types/TypeChecker.java
+@@ -2839,10 +2839,15 @@ && isBooleanIntrinsicName(member.member())) {
+             }
+             Type collectionMember = builtinCollectionMember(sumReceiver, member.member());
+             if (isStringLike(sumReceiver)) {
+-                if (member.member().equals("replace_literal")) {
+-                    return new Function(List.of(Primitive.STRING, Primitive.STRING), Primitive.STRING);
+-                }
+-                throw new IllegalArgumentException("unknown string member '" + member.member() + "'");
++                return switch (member.member()) {
++                    case "replace_literal" -> new Function(List.of(Primitive.STRING, Primitive.STRING), Primitive.STRING);
++                    case "split_literal" -> new Function(List.of(Primitive.STRING), new ListType(Primitive.STRING));
++                    case "trim" -> new Function(List.of(), Primitive.STRING);
++                    case "is_identifier", "is_route_segment" -> new Function(List.of(), Primitive.BOOL);
++                    case "starts_with", "ends_with", "contains_literal" ->
++                            new Function(List.of(Primitive.STRING), Primitive.BOOL);
++                    default -> throw new IllegalArgumentException("unknown string member '" + member.member() + "'");
++                };
+             }
+             if (collectionMember != null) return collectionMember;
+             if (sumReceiver instanceof ListType || sumReceiver instanceof Tuple) {
+@@ -4113,6 +4118,27 @@ private Ast.ClassDecl actorClassForRef(Named actorRef) {
+ 
+     private static Type builtinIoMember(Type receiver, String name) {
+         if (!(receiver instanceof Named named)) return null;
++        if (named.name().equals("fs") || named.name().equals("File")) {
++            Type string = Primitive.STRING;
++            Type booleanType = Primitive.BOOL;
++            switch (name) {
++                case "list_dir": return new Function(List.of(string), new ListType(string));
++                case "is_dir", "is_symlink", "exists": return new Function(List.of(string), booleanType);
++                case "read_text": return new Function(List.of(string), string);
++                case "write_text", "write_text_atomic", "append_text":
++                    return new Function(List.of(string, string), Primitive.VOID);
++                case "remove", "mkdir_all": return new Function(List.of(string), Primitive.VOID);
++                default: break;
++            }
++        }
++        if (named.name().equals("env")) {
++            switch (name) {
++                case "get": return new Function(List.of(Primitive.STRING),
++                        new Named("Option", List.of(Primitive.STRING)));
++                case "has": return new Function(List.of(Primitive.STRING), Primitive.BOOL);
++                default: break;
++            }
++        }
+         Type result;
+         List<Type> parameters;
+         switch (named.name()) {
+diff --git a/src/test/java/dev/oreslang/runtime/NativeCliIoTest.java b/src/test/java/dev/oreslang/runtime/NativeCliIoTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/oreslang/runtime/NativeCliIoTest.java
+@@ -0,0 +1,179 @@
++package dev.oreslang.runtime;
++
++import dev.oreslang.compiler.OresCompiler;
++import org.junit.jupiter.api.Test;
++
++import java.io.ByteArrayOutputStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.Set;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++final class NativeCliIoTest {
++    @Test
++    void stringOperationsCompileAndRunWithoutHostInterop() throws Exception {
++        String source = """
++            pub routine main(): void {
++              val fields = "GET /users/{id}".split_literal(" ");
++              stdio.println(fields.get(0));
++              stdio.println(fields.get(1));
++              stdio.println("   hi  ".trim());
++              stdio.println("route.ores".ends_with(".ores"));
++              stdio.println("prefix".starts_with("pre"));
++              stdio.println("abc".contains_literal("b"));
++              stdio.println("route_name".is_identifier());
++              stdio.println("[id]".is_route_segment());
++              stdio.println("[bad/path]".is_route_segment());
++              return;
++            }
++            """;
++        OresCompiler.parseAndTypeCheck(source);
++        Path file = Files.createTempFile("ores-cli-string-", ".ores");
++        Files.writeString(file, source);
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        LinkedProgramRunner.run(file, IsolatePolicy.developer(), ExecutionProfile.serverJit(),
++                Set.of(), System.getenv(), out, new ByteArrayOutputStream());
++        String logged = out.toString(java.nio.charset.StandardCharsets.UTF_8);
++        assertTrue(logged.contains("GET"));
++        assertTrue(logged.contains("/users/{id}"));
++        assertTrue(logged.contains("hi"));
++        assertTrue(logged.contains("true"));
++        assertTrue(logged.contains("false"));
++    }
++
++    @Test
++    void directoryReadIsSortedAndSymlinksAreNotTraversed() throws Exception {
++        Path root = Files.createTempDirectory("ores-cli-dir-").toRealPath();
++        Files.writeString(root.resolve("b.ores"), "b");
++        Files.writeString(root.resolve("a.ores"), "a");
++        Path escape = Files.createTempDirectory("ores-cli-escape-").toRealPath();
++        Path link = root.resolve("link");
++        Files.createSymbolicLink(link, escape);
++
++        RuntimePermissions permissions = RuntimePermissions.denyAll()
++                .withAllowed(RuntimePermissions.Permission.READ, root.toString());
++        IsolatePolicy policy = IsolatePolicy.developer()
++                .withCapabilities(IsolatePolicy.Capability.FILESYSTEM_READ);
++        String source = """
++            pub routine main(): void {
++              val names = fs.list_dir("%s");
++              stdio.println(names.get(0));
++              stdio.println(names.get(1));
++              stdio.println(fs.is_dir("%s"));
++              stdio.println(fs.is_symlink("%s"));
++              return;
++            }
++            """.formatted(root.toString().replace("\\", "\\\\"),
++                root.toString().replace("\\", "\\\\"),
++                link.toString().replace("\\", "\\\\"));
++        Path sourceFile = root.resolve("main.ores");
++        Files.writeString(sourceFile, source);
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        LinkedProgramRunner.run(sourceFile, policy, permissions, PermissionCheckMode.RUNTIME,
++                ExecutionProfile.serverJit(), Set.of(), System.getenv(),
++                out, new ByteArrayOutputStream());
++        String logged = out.toString(java.nio.charset.StandardCharsets.UTF_8);
++        assertTrue(logged.contains("a.ores"));
++        assertTrue(logged.contains("b.ores"));
++        assertTrue(logged.contains("true"));
++        String rejected = """
++            pub routine main(): void {
++              val children = fs.list_dir("%s");
++              return;
++            }
++            """.formatted(link.toString().replace("\\", "\\\\"));
++        Files.writeString(sourceFile, rejected);
++        assertThrows(RuntimeException.class, () ->
++                LinkedProgramRunner.run(sourceFile, policy, permissions, PermissionCheckMode.RUNTIME,
++                        ExecutionProfile.serverJit(), Set.of(), System.getenv(),
++                        new ByteArrayOutputStream(), new ByteArrayOutputStream()));
++    }
++
++    @Test
++    void parsesFullNativeStackCliSource() throws Exception {
++        String source = Files.readString(
++                Path.of("src/test/resources/oreslang/stack-cli-main.ores"));
++        assertTrue(source.contains("fnc api_leaf"));
++        assertTrue(source.contains("fnc walk"));
++        assertTrue(source.contains("fs.write_text_atomic"));
++        OresCompiler.parseAndTypeCheck(source);
++    }
++
++    @Test
++    void atomicGenerationReplacesFilesAndRejectsEscapePaths() throws Exception {
++        Path root = Files.createTempDirectory("ores-cli-atomic-").toRealPath();
++        Path outside = Files.createTempDirectory("ores-cli-outside-").toRealPath();
++        Path target = root.resolve("rpc.ores");
++        Path output = root.resolve("program.ores");
++        String program = """
++            pub routine main(): void {
++              fs.write_text_atomic("%s", "first");
++              fs.write_text_atomic("%s", "second");
++              return;
++            }
++            """.formatted(target, target);
++        Files.writeString(output, program);
++        RuntimePermissions permissions = RuntimePermissions.denyAll()
++                .withAllowed(RuntimePermissions.Permission.WRITE, root.toString())
++                .withAllowed(RuntimePermissions.Permission.READ, root.toString());
++        IsolatePolicy policy = IsolatePolicy.developer()
++                .withCapabilities(IsolatePolicy.Capability.FILESYSTEM_WRITE,
++                        IsolatePolicy.Capability.FILESYSTEM_READ);
++        LinkedProgramRunner.run(output, policy, permissions, PermissionCheckMode.RUNTIME,
++                ExecutionProfile.serverJit(), Set.of(), System.getenv(),
++                new ByteArrayOutputStream(), new ByteArrayOutputStream());
++        assertEquals("second", Files.readString(target));
++        Path symlink = root.resolve("outside-link.ores");
++        Files.createSymbolicLink(symlink, outside.resolve("outside-link.ores"));
++        Files.writeString(output, """
++            pub routine main(): void {
++              fs.write_text_atomic("%s", "forbidden");
++              return;
++            }
++            """.formatted(symlink));
++        assertThrows(RuntimeException.class, () ->
++                LinkedProgramRunner.run(output, policy, permissions, PermissionCheckMode.RUNTIME,
++                        ExecutionProfile.serverJit(), Set.of(), System.getenv(),
++                        new ByteArrayOutputStream(), new ByteArrayOutputStream()));
++        assertFalse(Files.exists(outside.resolve("outside-link.ores")));
++        Path ancestor = root.resolve("escape-dir");
++        Files.createSymbolicLink(ancestor, outside);
++        Files.writeString(output, """
++            pub routine main(): void {
++              fs.write_text_atomic("%s", "forbidden");
++              return;
++            }
++            """.formatted(ancestor.resolve("write.ores")));
++        assertThrows(RuntimeException.class, () ->
++                LinkedProgramRunner.run(output, policy, permissions, PermissionCheckMode.RUNTIME,
++                        ExecutionProfile.serverJit(), Set.of(), System.getenv(),
++                        new ByteArrayOutputStream(), new ByteArrayOutputStream()));
++        assertFalse(Files.exists(outside.resolve("write.ores")));
++    }
++    @Test
++    void metadataCannotEscapeReadScopeThroughSymlinkedParent() throws Exception {
++        Path root = Files.createTempDirectory("ores-cli-metadata-").toRealPath();
++        Path outside = Files.createTempDirectory("ores-cli-meta-outside-").toRealPath();
++        Files.writeString(outside.resolve("secret.txt"), "hidden");
++        Path escape = root.resolve("escape");
++        Files.createSymbolicLink(escape, outside);
++        Path sourceFile = root.resolve("program.ores");
++        Files.writeString(sourceFile, """
++            pub routine main(): void {
++              stdio.println(fs.is_dir("%s"));
++              return;
++            }
++            """.formatted(escape.resolve("secret.txt")));
++        RuntimePermissions permissions = RuntimePermissions.denyAll()
++                .withAllowed(RuntimePermissions.Permission.READ, root.toString());
++        IsolatePolicy policy = IsolatePolicy.developer()
++                .withCapabilities(IsolatePolicy.Capability.FILESYSTEM_READ);
++        assertThrows(RuntimeException.class, () ->
++                LinkedProgramRunner.run(sourceFile, policy, permissions,
++                        PermissionCheckMode.RUNTIME, ExecutionProfile.serverJit(), Set.of(),
++                        System.getenv(), new ByteArrayOutputStream(),
++                        new ByteArrayOutputStream()));
++    }
++
++}
+diff --git a/src/test/resources/oreslang/stack-cli-main.ores b/src/test/resources/oreslang/stack-cli-main.ores
+new file mode 100644
+--- /dev/null
++++ b/src/test/resources/oreslang/stack-cli-main.ores
+@@ -0,0 +1,424 @@
++// Oreslang-native file-route inventory, RPC and Lambda source adapters.
++// No Rust generator. The Java/Graal stdlib provides scoped fs.list_dir,
++// fs.is_dir, fs.is_symlink and literal string primitives (source.java PR #496).
++//
++// CLI policy: never report a successful operation without a verified action
++// receipt. Host executable invocation remains in the narrow Bash launcher.
++
++// The reference runtime currently resolves constants at code-unit scope,
++// not through nested callable environments. Keep source markers in functions.
++fnc generated_marker(): String {
++  return "// @generated by oreslang-stack-cli; DO NOT EDIT.\n";
++}
++
++fnc inventory_schema(): String {
++  return "oreslang.stack.inventory/v1";
++}
++
++fnc error(String message): String {
++  return "ERROR: " + message;
++}
++
++fnc is_error(String result): bool {
++  return result.starts_with("ERROR:");
++}
++
++fnc quote_json(String raw): String {
++  val String escaped = raw.replace_literal("\\", "\\\\")
++    .replace_literal("\"", "\\\"")
++    .replace_literal("\n", "\\n")
++    .replace_literal("\r", "\\r")
++    .replace_literal("\t", "\\t");
++  return "\"" + escaped + "\"";
++}
++
++fnc repository_role(String root): String {
++  val String path = root + "/oreslang-stack.toml";
++  if fs.is_symlink(path); then
++    return error("project manifest is a symlink");
++  fi
++  if !fs.exists(path); then
++    return error("missing oreslang-stack.toml");
++  fi
++  val lines = fs.read_text(path).split_literal("\n");
++  let String section = "";
++  let String role = "";
++  for const raw of lines {
++    val String line = raw.trim();
++    if line == "" | line.starts_with("#"); then
++      continue;
++    fi
++    if line.starts_with("["); then
++      if line != "[repository]"; then
++        return error("unsupported oreslang-stack.toml section");
++      fi
++      section = "repository";
++    else
++      val parts = line.split_literal("=");
++      if parts.size != 2 | section != "repository" | parts[0].trim() != "role" | role != ""; then
++        return error("expected exactly one [repository] role");
++      fi
++      role = parts[1].trim();
++    fi
++  }
++  if role == "\"api\""; then return "api"; fi
++  if role == "\"admin-api\""; then return "admin-api"; fi
++  if role == "\"web\""; then return "web"; fi
++  if role == "\"admin-web\""; then return "admin-web"; fi
++  return error("invalid repository role; expected api|admin-api|web|admin-web");
++}
++
++fnc is_api(String role): bool {
++  if role == "api" | role == "admin-api"; then return true; fi
++  return false;
++}
++
++fnc route_path(String route, String segment): String {
++  if !segment.is_route_segment(); then
++    return error("invalid filesystem route segment: " + segment);
++  fi
++  let String component = segment;
++  if segment.starts_with("["); then
++    component = "{" + segment.replace_literal("[", "").replace_literal("]", "") + "}";
++  fi
++  if route == "/"; then return "/" + component; fi
++  return route + "/" + component;
++}
++
++fnc route_shape(String shape, String segment): String {
++  let String component = segment;
++  if segment.starts_with("["); then component = "{}"; fi
++  if shape == "/"; then return "/" + component; fi
++  return shape + "/" + component;
++}
++
++// Return "" on success, ERROR on refusal. The native guest owns all writes.
++// Dry pass checks ownership and signatures before any output mutation.
++fnc sync_one(String path, String generated, bool check, bool dry): String {
++  if fs.is_symlink(path); then
++    return error("symlinked output: " + path);
++  fi
++  if fs.exists(path); then
++    val String previous = fs.read_text(path);
++    if path.ends_with(".ores"), !previous.starts_with(generated_marker()); then
++      return error("refusing to overwrite hand-authored code: " + path);
++    fi
++    if path.ends_with(".json"), !previous.starts_with("{\n  \"schema\": \"oreslang.stack.inventory/v1\""); then
++      return error("refusing to overwrite unowned route manifest: " + path);
++    fi
++    if check, previous != generated; then
++      return error("stale generated output: " + path);
++    fi
++    if previous == generated; then
++      return "";
++    fi
++  else
++    if check; then return error("missing generated output: " + path); fi
++  fi
++  if !dry, !check; then
++    fs.write_text_atomic(path, generated);
++  fi
++  return "";
++}
++
++fnc http_method(String method): bool {
++  if method == "GET" | method == "POST" | method == "PUT" |
++    method == "PATCH" | method == "DELETE" | method == "HEAD" |
++    method == "OPTIONS"; then
++    return true;
++  fi
++  return false;
++}
++
++// On success returns newline-terminated manifest row(s).
++fnc api_leaf(String root, String dir, String url, String kind, bool check, bool dry): String {
++  val String path = dir + "/route.ores";
++  val String handler_path = dir + "/handlers.ores";
++  if fs.is_symlink(path) | fs.is_symlink(handler_path); then
++    return error("symlinked route source or handlers: " + dir);
++  fi
++  if !fs.exists(handler_path); then
++    return error("route.ores requires sibling handlers.ores: " + dir);
++  fi
++  val String source = fs.read_text(path);
++  val String handlers = fs.read_text(handler_path);
++  let String manifest = "";
++  let String rpc = generated_marker() + "// Transport-neutral RPC adapters; typed transports remain host-specific.\nimport module route from \"./route\";\n\ndefine module rpc as\n";
++  let String lambda = generated_marker() + "// Oreslang Lambda source exports; runtime transport must be admitted.\nimport module rpc from \"./rpc\";\n\ndefine module lambda as\n";
++  let String seen = "|";
++  let count = 0;
++  for const raw of source.split_literal("\n") {
++    val String line = raw.trim();
++    if !line.starts_with("// @ores-route"); then continue; fi
++    val fields = line.split_literal(" ");
++    if fields.size != 5 | fields[0] != "//" | fields[1] != "@ores-route"; then
++      return error("invalid route annotation: " + path);
++    fi
++    val String method = fields[2];
++    val String declared = fields[3];
++    val String symbol = fields[4];
++    if !http_method(method) | declared != url | !symbol.is_identifier(); then
++      return error("invalid HTTP method, path or handler: " + line);
++    fi
++    if seen.contains_literal("|" + method + "|") | seen.contains_literal("|@" + symbol + "|"); then
++      return error("duplicate HTTP method or RPC symbol: " + path);
++    fi
++    if !handlers.contains_literal("pub fnc " + symbol + "(String request)") |
++      !source.contains_literal("pub fnc " + symbol + "(String request)") |
++      !source.contains_literal("handlers." + symbol + "(request)"); then
++      return error("route must forward public String handler: " + symbol);
++    fi
++    seen = seen + method + "|@" + symbol + "|";
++    rpc = rpc + "pub fnc rpc_" + symbol + "(String request) -> String {\n  return route." + symbol + "(request);\n}\n\n";
++    lambda = lambda + "pub fnc invoke_" + symbol + "(String request) -> String {\n  return rpc.rpc_" + symbol + "(request);\n}\n\n";
++    manifest = manifest + "@J|{\"kind\":\"route\",\"method\":" + quote_json(method) +
++      ",\"path\":" + quote_json(url) +
++      ",\"handler\":" + quote_json(symbol) +
++      ",\"source\":" + quote_json(dir.replace_literal(root + "/", "") + "/route.ores") + "}\n";
++    count = count + 1;
++  }
++  if count == 0; then return error("no @ores-route declarations: " + path); fi
++  rpc = rpc + "end\n";
++  lambda = lambda + "end\n";
++
++  if kind == "all" | kind == "rpc"; then
++    val String status = sync_one(dir + "/rpc.ores", rpc, check, dry);
++    if is_error(status); then return status; fi
++  fi
++  if kind == "all" | kind == "lambda"; then
++    // Generated Lambda uses the generated RPC module. No implicit creation
++    // when only "lambda" was requested.
++    val String rpc_status = sync_one(dir + "/rpc.ores", rpc, true, true);
++    if kind == "lambda", is_error(rpc_status); then
++      return error("Lambda requires current RPC adapter: " + dir);
++    fi
++    val String status = sync_one(dir + "/lambda.ores", lambda, check, dry);
++    if is_error(status); then return status; fi
++  fi
++  return manifest;
++}
++
++fnc web_leaf(String root, String dir, String url, String kind, bool check, bool dry): String {
++  if kind == "rpc"; then
++    return error("web pages do not produce RPC operations");
++  fi
++  val String path = dir + "/page.ores";
++  if fs.is_symlink(path); then return error("symlinked page source: " + path); fi
++  val String source = fs.read_text(path);
++  let String renderer = "";
++  for const raw of source.split_literal("\n") {
++    val String line = raw.trim();
++    if !line.starts_with("// @ores-page"); then continue; fi
++    val fields = line.split_literal(" ");
++    if fields.size != 4 | fields[0] != "//" | fields[1] != "@ores-page" |
++      fields[2] != url | !fields[3].is_identifier() | renderer != ""; then
++      return error("invalid or duplicate @ores-page: " + path);
++    fi
++    renderer = fields[3];
++  }
++  if renderer == "" | !source.contains_literal("pub fnc " + renderer + "(String request)"); then
++    return error("page requires public String renderer: " + path);
++  fi
++  val String lambda = generated_marker() + "// Web Lambda adapter; server supplies request/response transport.\n" +
++    "import module page from \"./page\";\n\ndefine module lambda as\n" +
++    "pub fnc invoke_page(String request) -> String {\n  return page." + renderer + "(request);\n}\nend\n";
++  if kind == "all" | kind == "lambda"; then
++    val String status = sync_one(dir + "/lambda.ores", lambda, check, dry);
++    if is_error(status); then return status; fi
++  fi
++  return "@J|{\"kind\":\"page\",\"path\":" + quote_json(url) +
++    ",\"handler\":" + quote_json(renderer) +
++    ",\"source\":" + quote_json(dir.replace_literal(root + "/", "") + "/page.ores") + "}\n";
++}
++
++// Recursive *Oreslang* directory discovery. The directory list is sorted by
++// the guest stdlib, so source manifest rows and generated bytes are stable.
++fnc walk(String root, String dir, String url, String shape,
++         String role, String kind, bool check, bool dry, int depth): String {
++  if depth > 32; then return error("route nesting exceeds 32: " + dir); fi
++  if fs.is_symlink(dir); then return error("symlinked route directory: " + dir); fi
++  if !fs.is_dir(dir); then return error("missing source directory: " + dir); fi
++  val api = is_api(role);
++  val String leaf_name = api ? "route.ores" : "page.ores";
++  let String result = "";
++  val String leaf_path = dir + "/" + leaf_name;
++  val has_leaf = fs.exists(leaf_path);
++  if has_leaf; then
++    val String manifest = api ? api_leaf(root, dir, url, kind, check, dry) :
++      web_leaf(root, dir, url, kind, check, dry);
++    if is_error(manifest); then return manifest; fi
++    result = "@S|" + shape + "|\n" + manifest;
++  fi
++
++  for const raw_name of fs.list_dir(dir) {
++    val String name = raw_name;
++    val String child = dir + "/" + name;
++    if fs.is_symlink(child); then
++      return error("symlink in route tree: " + child);
++    fi
++    if fs.is_dir(child); then
++      val String next_url = route_path(url, name);
++      if is_error(next_url); then return next_url; fi
++      val String next_shape = route_shape(shape, name);
++      val String nested = walk(root, child, next_url, next_shape, role, kind, check, dry, depth + 1);
++      if is_error(nested); then return nested; fi
++      result = result + nested;
++    else
++      if name == "rpc.ores" | name == "lambda.ores"; then
++        let bool targeted = false;
++        if kind == "all"; then targeted = true; fi
++        if kind == "rpc", name == "rpc.ores"; then targeted = true; fi
++        if kind == "lambda", name == "lambda.ores"; then targeted = true; fi
++        let bool valid = false;
++        if has_leaf; then
++          if api; then
++            if name == "rpc.ores" | name == "lambda.ores"; then
++              valid = true;
++            fi
++          else
++            if name == "lambda.ores"; then valid = true; fi
++          fi
++        fi
++        if targeted, !valid; then
++          val String old = fs.read_text(child);
++          if !old.starts_with(generated_marker()); then
++            return error("unowned adapter in route tree: " + child);
++          fi
++          if check; then return error("orphan generated adapter: " + child); fi
++          if !dry; then fs.remove(child); fi
++        fi
++      fi
++    fi
++  }
++  return result;
++}
++
++fnc manifest_from_records(String role, String records): String {
++  let String seen_shapes = "|";
++  let String json_rows = "";
++  let count = 0;
++  for const raw_line of records.split_literal("\n") {
++    val String line = raw_line;
++    if line.starts_with("@S|"); then
++      if seen_shapes.contains_literal(line); then
++        return error("ambiguous dynamic route path shape: " + line);
++      fi
++      seen_shapes = seen_shapes + line;
++    else
++      if line.starts_with("@J|"); then
++        if count > 0; then json_rows = json_rows + ",\n"; fi
++        json_rows = json_rows + "    " + line.replace_literal("@J|", "");
++        count = count + 1;
++      fi
++    fi
++  }
++  if count == 0; then return error("no route/page.ores sources discovered"); fi
++  return "{\n  \"schema\": " + quote_json(inventory_schema()) +
++    ",\n  \"role\": " + quote_json(role) +
++    ",\n  \"entries\": [\n" + json_rows + "\n  ]\n}\n";
++}
++
++fnc route_manifest(String root, String role, String kind, bool check, bool dry): String {
++  val String folder = is_api(role) ? "routes" : "pages";
++  val String path = root + "/src/" + folder;
++  val String records = walk(root, path, "/", "/", role, kind, check, dry, 0);
++  if is_error(records); then return records; fi
++  return manifest_from_records(role, records);
++}
++
++fnc generate(String root, String role, String kind, bool check): String {
++  if kind != "all", kind != "rpc", kind != "lambda"; then
++    return error("generate expects all|rpc|lambda");
++  fi
++  if !is_api(role), kind == "rpc"; then
++    return error("web pages do not produce RPC operations");
++  fi
++  // Phase 1: validate every source and pre-existing artifact before writes.
++  val String inspected = route_manifest(root, role, kind, false, true);
++  if is_error(inspected); then return inspected; fi
++
++  // Manifest path ownership must be admitted before changing any adapter.
++  // In particular, a hand-authored manifest cannot cause partial generation.
++  if kind == "all"; then
++    val String parent = root + "/generated";
++    if fs.is_symlink(parent); then return error("generated manifest parent is symlink"); fi
++    if fs.exists(parent), !fs.is_dir(parent); then
++      return error("generated manifest parent is not a directory");
++    fi
++    if fs.exists(parent); then
++      val String existing = sync_one(parent + "/route-manifest.json", inspected, check, true);
++      if is_error(existing); then return existing; fi
++    else
++      if check; then return error("missing generated output: " + parent); fi
++    fi
++  fi
++
++  // Phase 2: verify or materialize byte-stable Oreslang adapters.
++  val String manifest = route_manifest(root, role, kind, check, false);
++  if is_error(manifest); then return manifest; fi
++  if kind == "all"; then
++    val String parent = root + "/generated";
++    if !fs.exists(parent); then fs.mkdir_all(parent); fi
++    val String state = sync_one(parent + "/route-manifest.json", manifest, check, false);
++    if is_error(state); then return state; fi
++  fi
++  return "";
++}
++
++fnc admission(String root, String entry, String action): String {
++  val String role = repository_role(root);
++  if is_error(role); then return role; fi
++  val String entry_path = root + "/" + entry;
++  if fs.is_symlink(entry_path) | !fs.exists(entry_path); then
++    return error("missing or symlinked Oreslang application entrypoint");
++  fi
++  if action == "routes"; then
++    // Source inventory is intentionally independent of previously generated
++    // adapters. This action needs no write capability.
++    return route_manifest(root, role, "routes", false, true);
++  fi
++  if action == "deploy"; then
++    return error("deploy denied: no certified compiler artifact or host adapter");
++  fi
++  if action == "generate"; then
++    val String kind = env.get("ORESLANG_STACK_KIND").unwrap();
++    val String check = env.get("ORESLANG_STACK_CHECK").unwrap();
++    val String result = generate(root, role, kind, check == "true");
++    if is_error(result); then return result; fi
++    return "ORESLANG_STACK_ACTION_v1:generated";
++  fi
++  if action == "check"; then
++    val String result = generate(root, role, "all", true);
++    if is_error(result); then return result; fi
++    return "ORESLANG_STACK_ACTION_v1:check";
++  fi
++  if action == "dev" | action == "build"; then
++    val String result = generate(root, role, "all", false);
++    if is_error(result); then return result; fi
++    return "ORESLANG_STACK_ACTION_v1:" + action;
++  fi
++  return error("unknown command: " + action);
++}
++
++pub routine main(): void {
++  val String command = env.get("ORESLANG_STACK_COMMAND").unwrap();
++  val String root = env.get("ORESLANG_STACK_ROOT").unwrap();
++  val String entry = env.get("ORESLANG_STACK_ENTRY").unwrap();
++  val String backend = env.get("ORESLANG_STACK_BACKEND").unwrap();
++
++  if command == "deploy"; then
++    stdio.println(error("deploy denied: host adapter and runtime receipt are not certified"));
++    return;
++  fi
++  if backend != "graal"; then
++    stdio.println(error("LLVM backend is not ready for this CLI"));
++    return;
++  fi
++  val String result = admission(root, entry, command);
++  if command == "routes", !is_error(result); then
++    stdio.println("ORESLANG_STACK_JSON_v1:" + result);
++  else
++    stdio.println(result);
++  fi
++  return;
++}
+diff --git a/tools/stdlib-boundary-audit/Cargo.toml b/tools/stdlib-boundary-audit/Cargo.toml
+new file mode 100644
+--- /dev/null
++++ b/tools/stdlib-boundary-audit/Cargo.toml
+@@ -0,0 +1,6 @@
++[package]
++name = "oreslang-stdlib-boundary-audit"
++version = "0.1.0"
++edition = "2021"
++
++[dependencies]
+diff --git a/tools/stdlib-boundary-audit/src/main.rs b/tools/stdlib-boundary-audit/src/main.rs
+new file mode 100644
+--- /dev/null
++++ b/tools/stdlib-boundary-audit/src/main.rs
+@@ -0,0 +1,160 @@
++//! A conservative source-level gate for packaged native Oreslang stdlib modules.
++//! This does NOT replace compiler admission, sandboxing, or runtime capability checks.
++use std::{env, fs, path::Path, process};
++
++const MAX_FILE: u64 = 2 * 1024 * 1024;
++const MAX_FILES: usize = 2048;
++
++#[derive(Clone, Debug, PartialEq)]
++enum Kind { Name, Literal, Symbol(char) }
++#[derive(Clone, Debug)]
++struct Token { kind: Kind, text: String, line: usize }
++impl Token {
++    fn name(&self, name: &str) -> bool { self.kind == Kind::Name && self.text == name }
++    fn symbol(&self, c: char) -> bool { self.kind == Kind::Symbol(c) }
++}
++
++fn lex(s: &str) -> Result<Vec<Token>, String> {
++    let b = s.as_bytes();
++    let (mut p, mut line, mut out) = (0, 1, Vec::new());
++    while p < b.len() {
++        let start = p;
++        match b[p] {
++            b'\n' => { line += 1; p += 1; }
++            b' ' | b'\r' | b'\t' => p += 1,
++            b'/' if b.get(p + 1) == Some(&b'/') => {
++                p += 2;
++                while p < b.len() && b[p] != b'\n' { p += 1; }
++            }
++            b'/' if b.get(p + 1) == Some(&b'*') => {
++                p += 2;
++                let mut depth = 1;
++                while p < b.len() && depth > 0 {
++                    if b[p..].starts_with(b"/*") {
++                        depth += 1;
++                        if depth > 64 { return Err(format!("line {line}: comment nesting limit")); }
++                        p += 2;
++                    } else if b[p..].starts_with(b"*/") {
++                        depth -= 1;
++                        p += 2;
++                    } else {
++                        if b[p] == b'\n' { line += 1; }
++                        p += 1;
++                    }
++                }
++                if depth > 0 { return Err(format!("line {line}: unterminated comment")); }
++            }
++            b'\'' | b'"' | 96 => {
++                let (quote, initial) = (b[p], line);
++                p += 1;
++                let from = p;
++                while p < b.len() && b[p] != quote {
++                    if b[p] == b'\\' { p += 1; }
++                    if p < b.len() && b[p] == b'\n' { line += 1; }
++                    p += 1;
++                }
++                if p == b.len() { return Err(format!("line {initial}: unterminated literal")); }
++                let value = s.get(from..p).ok_or("invalid UTF-8 literal boundary")?;
++                if quote == 96 && value.contains('$') {
++                    return Err(format!("line {initial}: template expressions require compiler-side review"));
++                }
++                out.push(Token { kind: Kind::Literal, text: value.into(), line: initial });
++                p += 1;
++            }
++            c if c.is_ascii_alphabetic() || c == b'_' => {
++                p += 1;
++                while p < b.len() && (b[p].is_ascii_alphanumeric() || b[p] == b'_') { p += 1; }
++                out.push(Token { kind: Kind::Name, text: s[start..p].into(), line });
++            }
++            _ => {
++                let c = s[p..].chars().next().ok_or("invalid UTF-8 boundary")?;
++                p += c.len_utf8();
++                out.push(Token { kind: Kind::Symbol(c), text: c.to_string(), line });
++            }
++        }
++    }
++    Ok(out)
++}
++
++fn inspect(source: &str) -> Result<(), String> {
++    let tokens = lex(source)?;
++    for (i, t) in tokens.iter().enumerate() {
++        if t.name("java") && tokens.get(i + 1).is_some_and(|n| n.symbol('{') || n.symbol(':')) {
++            return Err(format!("line {}: Java host interop forbidden in stdlib", t.line));
++        }
++        if t.name("import") {
++            let rest = &tokens[i + 1..];
++            let size = rest.iter().position(|x| x.symbol(';'))
++                .ok_or_else(|| format!("line {}: import without terminator", t.line))?;
++            if size > 128 { return Err(format!("line {}: oversized import", t.line)); }
++            let statement = &rest[..size];
++            for (j, part) in statement.iter().enumerate() {
++                if part.name("from") {
++                    let src = &statement[j + 1..];
++                    if src.is_empty() { return Err(format!("line {}: missing import source", part.line)); }
++                    let name = src.iter().map(|t| t.text.as_str()).collect::<String>();
++                    if name.contains("..") || name.starts_with('/') || name.contains(':') || name.contains('\\') {
++                        return Err(format!("line {}: unsafe stdlib import source", part.line));
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++fn scan(root: &Path) -> Result<usize, String> {
++    if fs::symlink_metadata(root).map_err(|e| e.to_string())?.file_type().is_symlink() {
++        return Err("stdlib root is a symlink".into());
++    }
++    let mut pending = vec![(root.to_path_buf(), 0)];
++    let mut count = 0;
++    while let Some((dir, depth)) = pending.pop() {
++        if depth > 16 { return Err("stdlib nesting exceeds limit".into()); }
++        for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
++            let path = entry.map_err(|e| e.to_string())?.path();
++            let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
++            if meta.file_type().is_symlink() { return Err(format!("{}: symlink refused", path.display())); }
++            if meta.is_dir() { pending.push((path, depth + 1)); continue; }
++            if !meta.is_file() { return Err(format!("{}: unsupported entry", path.display())); }
++            if path.extension().is_none_or(|e| e != "ores") { continue; }
++            count += 1;
++            if count > MAX_FILES || meta.len() > MAX_FILE {
++                return Err(format!("{}: resource budget exceeded", path.display()));
++            }
++            let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
++            inspect(&source).map_err(|e| format!("{}: {e}", path.display()))?;
++        }
++    }
++    if count == 0 { return Err("stdlib contains no .ores files".into()); }
++    Ok(count)
++}
++
++fn main() {
++    let args: Vec<String> = env::args().skip(1).collect();
++    if args.len() > 1 || args.first().is_some_and(|s| s.starts_with('-')) {
++        eprintln!("usage: oreslang-stdlib-boundary-audit [stdlib-directory]");
++        process::exit(2);
++    }
++    let root = args.first().map(String::as_str).unwrap_or("stdlib");
++    match scan(Path::new(root)) {
++        Ok(n) => println!("verified {n} native Oreslang stdlib source file(s)"),
++        Err(e) => { eprintln!("stdlib boundary audit failed: {e}"); process::exit(1); }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test] fn normal_module() { assert!(inspect("define module testing\npub fnc f(): String { return \"java:foo\"; } end").is_ok()); }
++    #[test] fn nested_comments() { assert!(inspect("// java { }\n/* java { /* nested */ } */ fnc f(): void {}").is_ok()); }
++    #[test] fn rejects_java_block() { assert!(inspect("do java { System.exit(0); }").is_err()); }
++    #[test] fn rejects_java_import() { assert!(inspect("import java:java.lang.System;").is_err()); }
++    #[test] fn rejects_parent_import() { assert!(inspect("import types Foo from '../../other';").is_err()); }
++    #[test] fn rejects_external_url() { assert!(inspect("import types Foo from 'https://elsewhere';").is_err()); }
++    #[test] fn rejects_unclosed_comment() { assert!(inspect("/* broken").is_err()); }
++    #[test] fn rejects_unclosed_string() { assert!(inspect("let s = 'broken").is_err()); }
++    #[test] fn rejects_unsafe_template() { assert!(inspect("let s = " .to_owned().as_str()).is_ok()); assert!(inspect("let s = \u0060$x\u0060;").is_err()); }
++    #[test] fn accepts_std_import() { assert!(inspect("import types Foo from 'std/core';").is_ok()); }
++    #[test] fn accepts_utf8_text() { assert!(inspect("let s = 'π';").is_ok()); }
++}
